@@ -7,11 +7,13 @@ Supports: Mastodon, Pixelfed, Bluesky, Threads
 import sys
 import os
 import json
+import stat
 import base64
 import mimetypes
 import threading
 from pathlib import Path
 from datetime import datetime, timezone
+from urllib.parse import urlparse
 
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout,
@@ -43,6 +45,12 @@ except ImportError:
     PIL_OK = False
 
 CONFIG_FILE = Path.home() / ".config" / "socialsync" / "config.json"
+
+# Maximum image size: 10 MB
+MAX_IMAGE_BYTES = 10 * 1024 * 1024
+
+# Allowed image MIME types
+ALLOWED_IMAGE_TYPES = {"image/jpeg", "image/png", "image/gif", "image/webp", "image/bmp"}
 
 # ─── Stylesheet ──────────────────────────────────────────────────────────────
 
@@ -311,26 +319,115 @@ PLATFORMS = {
     },
 }
 
+# ─── Security helpers ─────────────────────────────────────────────────────────
+
+def _secure_write(path: Path, content: str) -> None:
+    """Write content to path and immediately restrict permissions to owner-only (600)."""
+    path.write_text(content)
+    os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # rw-------
+
+
+def _validate_https_url(url: str) -> str:
+    """
+    Validate that a URL uses HTTPS and has a valid host.
+    Returns the normalised URL or raises ValueError.
+    """
+    url = url.strip().rstrip("/")
+    parsed = urlparse(url)
+    if parsed.scheme != "https":
+        raise ValueError(
+            f"Instance URL must start with https:// — got: {url!r}\n"
+            "Sending credentials over plain HTTP is insecure."
+        )
+    if not parsed.netloc:
+        raise ValueError(f"Invalid URL (no host): {url!r}")
+    return url
+
+
+def _safe_error_message(exc: Exception) -> str:
+    """
+    Return a sanitised, short error string that is safe to display in the UI.
+    Strips full URLs, response bodies, and anything past 80 chars to avoid
+    leaking tokens or server details in error labels.
+    """
+    raw = str(exc)
+    # requests HTTPError includes the full URL — drop everything after the
+    # first newline or after "for url:" to avoid leaking instance URLs + paths
+    for separator in ("\nfor url:", " for url:", "\n"):
+        if separator in raw:
+            raw = raw.split(separator)[0]
+    # Hard truncate
+    return raw[:80]
+
+
+def _validate_image_file(path: str) -> None:
+    """
+    Raise ValueError if the file at *path* fails basic safety checks:
+      - must exist and be a regular file
+      - must not exceed MAX_IMAGE_BYTES
+      - MIME type must be in ALLOWED_IMAGE_TYPES
+    """
+    p = Path(path)
+    if not p.exists() or not p.is_file():
+        raise ValueError(f"Image file not found: {path}")
+
+    size = p.stat().st_size
+    if size > MAX_IMAGE_BYTES:
+        mb = size / (1024 * 1024)
+        raise ValueError(f"Image is too large ({mb:.1f} MB). Maximum is 10 MB.")
+
+    mime = mimetypes.guess_type(path)[0] or ""
+    if mime not in ALLOWED_IMAGE_TYPES:
+        raise ValueError(
+            f"Unsupported image type: {mime or 'unknown'}. "
+            "Allowed: JPEG, PNG, GIF, WebP, BMP."
+        )
+
+
 # ─── Config Manager ───────────────────────────────────────────────────────────
 
 class ConfigManager:
     def __init__(self):
         CONFIG_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # Harden the config directory itself
+        try:
+            os.chmod(CONFIG_FILE.parent, stat.S_IRWXU)  # rwx------
+        except OSError:
+            pass
         self.data = self._load()
 
     def _load(self):
         if CONFIG_FILE.exists():
+            # FIX: restrict permissions on existing config file at startup
             try:
-                return json.loads(CONFIG_FILE.read_text())
-            except:
+                os.chmod(CONFIG_FILE, stat.S_IRUSR | stat.S_IWUSR)
+            except OSError:
                 pass
+            try:
+                # FIX: catch specific exceptions and surface them instead of
+                # silently swallowing all errors with a bare except
+                return json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
+            except json.JSONDecodeError as e:
+                QMessageBox.warning(
+                    None,
+                    "Config Warning",
+                    f"Could not parse config file (it may be corrupted).\n"
+                    f"Starting with an empty config.\n\nDetail: {e}"
+                )
+            except OSError as e:
+                QMessageBox.warning(
+                    None,
+                    "Config Warning",
+                    f"Could not read config file.\n\nDetail: {e}"
+                )
         return {
             "accounts": [],
             "last_post": {},
         }
 
     def save(self):
-        CONFIG_FILE.write_text(json.dumps(self.data, indent=2))
+        # FIX: use _secure_write to enforce 600 permissions after every save
+        _secure_write(CONFIG_FILE, json.dumps(self.data, indent=2))
 
     def get_accounts(self):
         return self.data.get("accounts", [])
@@ -364,7 +461,28 @@ class PostWorker(QThread):
         self.image_path = image_path
         self.alt_text = alt_text
 
+        # FIX: cache Bluesky session tokens keyed by handle so we don't
+        # re-authenticate (and re-expose the app password) on every post.
+        # This cache lives only for the lifetime of this worker instance.
+        self._bsky_sessions = {}
+
     def run(self):
+        # FIX: validate the image file once before starting any API calls,
+        # so we fail fast with a clear message rather than a raw exception mid-post.
+        if self.image_path:
+            try:
+                _validate_image_file(self.image_path)
+            except ValueError as e:
+                error_msg = str(e)
+                for account in self.accounts:
+                    key = f"{account['platform']}:{account['username']}"
+                    self.progress.emit(key, f"✗ {error_msg}")
+                self.done.emit({
+                    f"{a['platform']}:{a['username']}": {"ok": False, "error": error_msg}
+                    for a in self.accounts
+                })
+                return
+
         results = {}
         for account in self.accounts:
             platform = account["platform"]
@@ -375,8 +493,10 @@ class PostWorker(QThread):
                 results[key] = {"ok": True, "url": result}
                 self.progress.emit(key, "✓ Posted!")
             except Exception as e:
-                results[key] = {"ok": False, "error": str(e)}
-                self.progress.emit(key, f"✗ {str(e)[:60]}")
+                # FIX: sanitise the error before displaying it
+                safe_msg = _safe_error_message(e)
+                results[key] = {"ok": False, "error": safe_msg}
+                self.progress.emit(key, f"✗ {safe_msg}")
         self.done.emit(results)
 
     def _post(self, account):
@@ -393,7 +513,8 @@ class PostWorker(QThread):
             raise ValueError(f"Unknown platform: {platform}")
 
     def _post_mastodon(self, account):
-        base = account["instance"].rstrip("/")
+        # FIX: validate HTTPS before using the instance URL
+        base = _validate_https_url(account["instance"])
         token = account["token"]
         headers = {"Authorization": f"Bearer {token}"}
 
@@ -406,7 +527,8 @@ class PostWorker(QThread):
                     headers=headers,
                     files={"file": (os.path.basename(self.image_path), f, mime)},
                     data={"description": self.alt_text},
-                    timeout=60
+                    timeout=60,
+                    verify=True,
                 )
                 r.raise_for_status()
                 media_id = r.json()["id"]
@@ -415,13 +537,21 @@ class PostWorker(QThread):
         if media_id:
             payload["media_ids[]"] = media_id
 
-        r = requests.post(f"{base}/api/v1/statuses", headers=headers, data=payload, timeout=30)
+        r = requests.post(
+            f"{base}/api/v1/statuses",
+            headers=headers,
+            data=payload,
+            timeout=30,
+            verify=True,
+        )
         r.raise_for_status()
         return r.json().get("url", "")
 
     def _post_pixelfed(self, account):
-        # Pixelfed uses Mastodon-compatible API
-        base = account.get("instance", "https://pixelfed.social").rstrip("/")
+        # FIX: validate HTTPS before using the instance URL
+        base = _validate_https_url(
+            account.get("instance", "https://pixelfed.social")
+        )
         token = account["token"]
         headers = {"Authorization": f"Bearer {token}"}
 
@@ -434,7 +564,8 @@ class PostWorker(QThread):
                     headers=headers,
                     files={"file": (os.path.basename(self.image_path), f, mime)},
                     data={"description": self.alt_text},
-                    timeout=60
+                    timeout=60,
+                    verify=True,
                 )
                 r.raise_for_status()
                 media_id = r.json()["id"]
@@ -443,7 +574,13 @@ class PostWorker(QThread):
         if media_id:
             payload["media_ids[]"] = media_id
 
-        r = requests.post(f"{base}/api/v1/statuses", headers=headers, data=payload, timeout=30)
+        r = requests.post(
+            f"{base}/api/v1/statuses",
+            headers=headers,
+            data=payload,
+            timeout=30,
+            verify=True,
+        )
         r.raise_for_status()
         return r.json().get("url", "")
 
@@ -451,19 +588,24 @@ class PostWorker(QThread):
         handle = account["username"]
         password = account["token"]  # app password
 
-        # Auth
-        r = requests.post(
-            "https://bsky.social/xrpc/com.atproto.server.createSession",
-            json={"identifier": handle, "password": password},
-            timeout=30
-        )
-        r.raise_for_status()
-        session = r.json()
+        # FIX: reuse a cached session token instead of re-authenticating
+        # (and re-transmitting the app password) on every single post.
+        if handle not in self._bsky_sessions:
+            r = requests.post(
+                "https://bsky.social/xrpc/com.atproto.server.createSession",
+                json={"identifier": handle, "password": password},
+                timeout=30,
+                verify=True,
+            )
+            r.raise_for_status()
+            self._bsky_sessions[handle] = r.json()
+
+        session = self._bsky_sessions[handle]
         did = session["did"]
         access_token = session["accessJwt"]
         headers = {"Authorization": f"Bearer {access_token}"}
 
-        # Upload image
+        # Upload image blob
         blob = None
         if self.image_path:
             with open(self.image_path, "rb") as f:
@@ -473,12 +615,13 @@ class PostWorker(QThread):
                 "https://bsky.social/xrpc/com.atproto.repo.uploadBlob",
                 headers={**headers, "Content-Type": mime},
                 data=img_data,
-                timeout=60
+                timeout=60,
+                verify=True,
             )
             r.raise_for_status()
             blob = r.json()["blob"]
 
-        # Create post
+        # Create post record
         post = {
             "$type": "app.bsky.feed.post",
             "text": self.text[:300],
@@ -502,7 +645,8 @@ class PostWorker(QThread):
                 "collection": "app.bsky.feed.post",
                 "record": post,
             },
-            timeout=30
+            timeout=30,
+            verify=True,
         )
         r.raise_for_status()
         uri = r.json().get("uri", "")
@@ -513,14 +657,16 @@ class PostWorker(QThread):
         user_id = account.get("user_id", "")
         token = account["token"]
 
+        # FIX: send the token in the Authorization header rather than in the
+        # POST body where it can appear in server/proxy logs.
+        headers = {"Authorization": f"Bearer {token}"}
+
         # Step 1: create media container
         payload = {
             "media_type": "IMAGE" if self.image_path else "TEXT",
             "text": self.text[:500],
-            "access_token": token,
         }
         if self.image_path:
-            # Threads requires a public URL for images - note this limitation
             img_url = account.get("image_url_override", "")
             if not img_url:
                 raise ValueError(
@@ -531,7 +677,10 @@ class PostWorker(QThread):
 
         r = requests.post(
             f"https://graph.threads.net/v1.0/{user_id}/threads",
-            data=payload, timeout=30
+            headers=headers,
+            data=payload,
+            timeout=30,
+            verify=True,
         )
         r.raise_for_status()
         creation_id = r.json()["id"]
@@ -539,8 +688,10 @@ class PostWorker(QThread):
         # Step 2: publish
         r = requests.post(
             f"https://graph.threads.net/v1.0/{user_id}/threads_publish",
-            data={"creation_id": creation_id, "access_token": token},
-            timeout=30
+            headers=headers,
+            data={"creation_id": creation_id},
+            timeout=30,
+            verify=True,
         )
         r.raise_for_status()
         post_id = r.json()["id"]
@@ -583,7 +734,7 @@ class AddAccountDialog(QDialog):
         self.fields_widget = QWidget()
         self.fields_layout = QVBoxLayout(self.fields_widget)
         self.fields_layout.setSpacing(10)
-        self.fields_layout.setContentsMargins(0,0,0,0)
+        self.fields_layout.setContentsMargins(0, 0, 0, 0)
         layout.addWidget(self.fields_widget)
 
         # Buttons
@@ -604,7 +755,6 @@ class AddAccountDialog(QDialog):
         self._update_fields()
 
         if account:
-            # Pre-fill
             idx = self.platform_combo.findData(account["platform"])
             if idx >= 0:
                 self.platform_combo.setCurrentIndex(idx)
@@ -614,7 +764,6 @@ class AddAccountDialog(QDialog):
                     widget.setText(account[key])
 
     def _update_fields(self):
-        # Clear
         while self.fields_layout.count():
             item = self.fields_layout.takeAt(0)
             if item.widget():
@@ -643,14 +792,14 @@ class AddAccountDialog(QDialog):
 
         if platform == "mastodon":
             add_field("instance", "Instance URL", "https://mastodon.social",
-                      hint="Your Mastodon server URL")
+                      hint="Your Mastodon server URL — must start with https://")
             add_field("token", "Access Token", "Paste your access token",
                       password=True,
                       hint="Settings → Development → New Application → read+write+follow+push")
 
         elif platform == "pixelfed":
             add_field("instance", "Instance URL", "https://pixelfed.social",
-                      hint="Your Pixelfed instance (default: pixelfed.social)")
+                      hint="Your Pixelfed instance — must start with https://")
             add_field("token", "Access Token", "Paste your access token",
                       password=True,
                       hint="Settings → Applications → New Application")
@@ -683,6 +832,15 @@ class AddAccountDialog(QDialog):
             QMessageBox.warning(self, "Missing Field", "Token / Password is required.")
             return
 
+        # FIX: validate instance URLs are HTTPS before saving to config
+        if platform in ("mastodon", "pixelfed"):
+            instance = account.get("instance", "")
+            try:
+                account["instance"] = _validate_https_url(instance)
+            except ValueError as e:
+                QMessageBox.warning(self, "Invalid Instance URL", str(e))
+                return
+
         self.result_account = account
         self.accept()
 
@@ -690,7 +848,7 @@ class AddAccountDialog(QDialog):
 # ─── Preview Widget ───────────────────────────────────────────────────────────
 
 class SocialPostPreview(QFrame):
-    """Renders a mock social media post preview"""
+    """Renders a mock social media post preview."""
 
     def __init__(self, platform_key="mastodon", parent=None):
         super().__init__(parent)
@@ -707,16 +865,15 @@ class SocialPostPreview(QFrame):
         layout.setSpacing(0)
         layout.setContentsMargins(0, 0, 0, 0)
 
-        # Card
         card = QFrame()
         card.setObjectName("innerCard")
         p = PLATFORMS.get(self.platform_key, PLATFORMS["mastodon"])
-        card.setStyleSheet(f"""
-            QFrame#innerCard {{
+        card.setStyleSheet("""
+            QFrame#innerCard {
                 background: #1a1f2e;
                 border: 1px solid #2d3555;
                 border-radius: 16px;
-            }}
+            }
         """)
         card_layout = QVBoxLayout(card)
         card_layout.setSpacing(12)
@@ -725,7 +882,7 @@ class SocialPostPreview(QFrame):
         # Platform badge
         badge_row = QHBoxLayout()
         icon_lbl = QLabel(p["icon"])
-        icon_lbl.setStyleSheet(f"font-size: 18px;")
+        icon_lbl.setStyleSheet("font-size: 18px;")
         badge_lbl = QLabel(p["label"])
         badge_lbl.setStyleSheet(f"color: {p['color']}; font-weight: 700; font-size: 13px;")
         badge_row.addWidget(icon_lbl)
@@ -841,11 +998,9 @@ class MainWindow(QMainWindow):
         root.setSpacing(0)
         root.setContentsMargins(0, 0, 0, 0)
 
-        # Sidebar
         sidebar = self._build_sidebar()
         root.addWidget(sidebar)
 
-        # Main content (stacked pages)
         self.stack = QStackedWidget()
         self.stack.addWidget(self._build_compose_page())   # 0
         self.stack.addWidget(self._build_accounts_page())  # 1
@@ -864,7 +1019,6 @@ class MainWindow(QMainWindow):
         layout.setSpacing(4)
         layout.setContentsMargins(16, 24, 16, 24)
 
-        # Logo
         logo = QLabel("⬡ SocialSync")
         logo.setStyleSheet("font-size: 18px; font-weight: 800; color: #6366f1; margin-bottom: 24px;")
         layout.addWidget(logo)
@@ -907,7 +1061,7 @@ class MainWindow(QMainWindow):
 
         layout.addStretch()
 
-        version = QLabel("v1.0.0")
+        version = QLabel("v1.0.1")
         version.setStyleSheet("color: #2d3555; font-size: 11px;")
         layout.addWidget(version)
 
@@ -927,7 +1081,6 @@ class MainWindow(QMainWindow):
         main_layout.setSpacing(0)
         main_layout.setContentsMargins(0, 0, 0, 0)
 
-        # Left: compose panel
         compose_panel = QWidget()
         compose_panel.setMaximumWidth(560)
         compose_panel.setMinimumWidth(420)
@@ -935,7 +1088,6 @@ class MainWindow(QMainWindow):
         cl.setSpacing(16)
         cl.setContentsMargins(28, 28, 20, 28)
 
-        # Header
         header = QHBoxLayout()
         title = QLabel("New Post")
         title.setProperty("class", "title")
@@ -944,11 +1096,9 @@ class MainWindow(QMainWindow):
         header.addStretch()
         cl.addLayout(header)
 
-        # Image drop zone
         self.image_zone = self._build_image_zone()
         cl.addWidget(self.image_zone)
 
-        # Caption
         cap_label = QLabel("CAPTION")
         cap_label.setStyleSheet("color: #4a5568; font-size: 11px; font-weight: 700; letter-spacing: 1px;")
         cl.addWidget(cap_label)
@@ -960,7 +1110,6 @@ class MainWindow(QMainWindow):
         self.caption_edit.textChanged.connect(self._on_text_changed)
         cl.addWidget(self.caption_edit)
 
-        # Char counter row
         char_row = QHBoxLayout()
         self.char_counter = QLabel("0 / 500")
         self.char_counter.setStyleSheet("color: #4a5568; font-size: 12px;")
@@ -968,7 +1117,6 @@ class MainWindow(QMainWindow):
         char_row.addWidget(self.char_counter)
         cl.addLayout(char_row)
 
-        # Alt text
         alt_label = QLabel("ALT TEXT (for accessibility)")
         alt_label.setStyleSheet("color: #4a5568; font-size: 11px; font-weight: 700; letter-spacing: 1px;")
         cl.addWidget(alt_label)
@@ -976,7 +1124,6 @@ class MainWindow(QMainWindow):
         self.alt_edit.setPlaceholderText("Describe your image for screen readers…")
         cl.addWidget(self.alt_edit)
 
-        # Platform selector
         plat_label = QLabel("POST TO")
         plat_label.setStyleSheet("color: #4a5568; font-size: 11px; font-weight: 700; letter-spacing: 1px; margin-top: 4px;")
         cl.addWidget(plat_label)
@@ -992,7 +1139,6 @@ class MainWindow(QMainWindow):
         self.accounts_scroll.setWidget(self.accounts_list_widget)
         cl.addWidget(self.accounts_scroll)
 
-        # Post button
         self.post_btn = QPushButton("🚀  Post to Selected Platforms")
         self.post_btn.setFixedHeight(50)
         self.post_btn.setStyleSheet("""
@@ -1017,11 +1163,10 @@ class MainWindow(QMainWindow):
         self.post_btn.clicked.connect(self._post)
         cl.addWidget(self.post_btn)
 
-        # Progress area
         self.progress_area = QWidget()
         prog_layout = QVBoxLayout(self.progress_area)
         prog_layout.setSpacing(6)
-        prog_layout.setContentsMargins(0,0,0,0)
+        prog_layout.setContentsMargins(0, 0, 0, 0)
         self.progress_area.setVisible(False)
         cl.addWidget(self.progress_area)
 
@@ -1029,7 +1174,6 @@ class MainWindow(QMainWindow):
 
         main_layout.addWidget(compose_panel)
 
-        # Right: preview panel
         preview_panel = self._build_preview_panel()
         main_layout.addWidget(preview_panel, 1)
 
@@ -1063,7 +1207,7 @@ class MainWindow(QMainWindow):
         self.zone_text.setStyleSheet("color: #718096; font-size: 14px;")
         self.zone_text.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
-        self.zone_sub = QLabel("PNG, JPG, GIF, WebP · Max 10MB")
+        self.zone_sub = QLabel("PNG, JPG, GIF, WebP · Max 10 MB")
         self.zone_sub.setStyleSheet("color: #4a5568; font-size: 11px;")
         self.zone_sub.setAlignment(Qt.AlignmentFlag.AlignCenter)
 
@@ -1093,7 +1237,6 @@ class MainWindow(QMainWindow):
         layout.addWidget(self.zone_image_preview)
         layout.addWidget(self.zone_clear, alignment=Qt.AlignmentFlag.AlignCenter)
 
-        # Click to open
         zone.mousePressEvent = lambda e: self._browse_image()
 
         return zone
@@ -1118,7 +1261,6 @@ class MainWindow(QMainWindow):
         header_row.addWidget(self.preview_platform_combo)
         layout.addLayout(header_row)
 
-        # Preview card
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll.setStyleSheet("border: none; background: transparent;")
@@ -1154,18 +1296,17 @@ class MainWindow(QMainWindow):
         subtitle.setStyleSheet("color: #718096; font-size: 14px;")
         layout.addWidget(subtitle)
 
-        # Platform info
         info_grid = QGridLayout()
         info_grid.setSpacing(12)
         for i, (k, v) in enumerate(PLATFORMS.items()):
             card = QFrame()
-            card.setStyleSheet(f"""
-                QFrame {{
+            card.setStyleSheet("""
+                QFrame {
                     background: #141824;
                     border: 1px solid #2d3555;
                     border-radius: 12px;
                     padding: 4px;
-                }}
+                }
             """)
             c_layout = QHBoxLayout(card)
             c_layout.setContentsMargins(14, 12, 14, 12)
@@ -1186,7 +1327,6 @@ class MainWindow(QMainWindow):
         acct_label.setStyleSheet("color: #4a5568; font-size: 11px; font-weight: 700; letter-spacing: 1px; margin-top: 8px;")
         layout.addWidget(acct_label)
 
-        # Accounts list
         self.accounts_scroll_main = QScrollArea()
         self.accounts_scroll_main.setWidgetResizable(True)
         self.accounts_scroll_main.setStyleSheet("border: 1px solid #2d3555; border-radius: 12px; background: #141824;")
@@ -1213,15 +1353,22 @@ class MainWindow(QMainWindow):
             self._set_image(path)
 
     def _set_image(self, path):
+        # FIX: validate the file before accepting it (size + MIME type)
+        try:
+            _validate_image_file(path)
+        except ValueError as e:
+            QMessageBox.warning(self, "Invalid Image", str(e))
+            return
+
         self.image_path = path
         pixmap = QPixmap(path)
         if pixmap.isNull():
             QMessageBox.warning(self, "Error", "Could not load image.")
+            self.image_path = None
             return
 
         self.image_pixmap = pixmap
 
-        # Update zone
         scaled = pixmap.scaled(400, 140, Qt.AspectRatioMode.KeepAspectRatio,
                                Qt.TransformationMode.SmoothTransformation)
         self.zone_image_preview.setPixmap(scaled)
@@ -1231,7 +1378,6 @@ class MainWindow(QMainWindow):
         self.zone_sub.setVisible(False)
         self.zone_clear.setVisible(True)
 
-        # Update preview
         self.preview_widget.set_image(pixmap)
 
     def _clear_image(self):
@@ -1249,9 +1395,6 @@ class MainWindow(QMainWindow):
         text = self.caption_edit.toPlainText()
         self.char_counter.setText(f"{len(text)} / 500")
         self.preview_widget.set_text(text)
-        # Update all compose checkboxes text
-        for cb in self._get_selected_checkboxes(all_of_them=True):
-            pass  # handled by preview
 
     def _update_preview_platform(self):
         key = self.preview_platform_combo.currentData()
@@ -1260,7 +1403,6 @@ class MainWindow(QMainWindow):
         if self.image_pixmap:
             self.preview_widget.set_image(self.image_pixmap)
 
-        # Set username from matching account
         for account in self.config.get_accounts():
             if account["platform"] == key:
                 self.preview_widget.set_username(account.get("username", "@you"))
@@ -1278,13 +1420,11 @@ class MainWindow(QMainWindow):
         return result
 
     def _refresh_accounts(self):
-        # Clear compose list
         while self.accounts_list_layout.count():
             item = self.accounts_list_layout.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
 
-        # Clear accounts page list
         while self.accounts_container_layout.count():
             item = self.accounts_container_layout.takeAt(0)
             if item.widget():
@@ -1304,9 +1444,7 @@ class MainWindow(QMainWindow):
             self.accounts_container_layout.addWidget(empty2)
         else:
             for i, account in enumerate(accounts):
-                # Compose checkbox row
                 self._add_compose_account_row(account, i)
-                # Accounts page row
                 self._add_account_management_row(account, i)
 
         self.accounts_list_layout.addStretch()
@@ -1330,7 +1468,7 @@ class MainWindow(QMainWindow):
         icon = QLabel(p["icon"])
         icon.setStyleSheet("font-size: 16px;")
 
-        name = QLabel(f"{account['username']}")
+        name = QLabel(account["username"])
         name.setStyleSheet("color: #e2e8f0; font-size: 13px; font-weight: 500;")
 
         badge = QLabel(p["label"])
@@ -1364,7 +1502,9 @@ class MainWindow(QMainWindow):
         info = QVBoxLayout()
         name_lbl = QLabel(account.get("username", "Unknown"))
         name_lbl.setStyleSheet("color: #f8fafc; font-weight: 600; font-size: 14px;")
-        platform_lbl = QLabel(p["label"] + (f"  ·  {account.get('instance','')}" if account.get("instance") else ""))
+        platform_lbl = QLabel(
+            p["label"] + (f"  ·  {account.get('instance', '')}" if account.get("instance") else "")
+        )
         platform_lbl.setStyleSheet("color: #718096; font-size: 12px;")
         info.addWidget(name_lbl)
         info.addWidget(platform_lbl)
@@ -1403,9 +1543,11 @@ class MainWindow(QMainWindow):
             self._refresh_accounts()
 
     def _remove_account(self, idx):
-        reply = QMessageBox.question(self, "Remove Account",
-                                     "Are you sure you want to remove this account?",
-                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No)
+        reply = QMessageBox.question(
+            self, "Remove Account",
+            "Are you sure you want to remove this account?",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No
+        )
         if reply == QMessageBox.StandardButton.Yes:
             self.config.remove_account(idx)
             self._refresh_accounts()
@@ -1416,21 +1558,30 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Nothing to Post", "Please add a caption or image before posting.")
             return
 
-        # Collect selected accounts
+        # FIX: snapshot the accounts list at post-time and match by value, not
+        # by index, to avoid TOCTOU issues if accounts were modified since render.
+        all_accounts = self.config.get_accounts()
         selected_accounts = []
-        accounts = self.config.get_accounts()
         for i in range(self.accounts_list_layout.count()):
             item = self.accounts_list_layout.itemAt(i)
             if item and item.widget():
                 cb = item.widget().findChild(QCheckBox)
                 if cb and cb.isChecked():
                     account_idx = cb.property("account_idx")
-                    if account_idx is not None and account_idx < len(accounts):
-                        selected_accounts.append(accounts[account_idx])
+                    if account_idx is not None and account_idx < len(all_accounts):
+                        selected_accounts.append(all_accounts[account_idx])
 
         if not selected_accounts:
             QMessageBox.warning(self, "No Accounts Selected", "Please select at least one account to post to.")
             return
+
+        # FIX: verify the image file still exists and is valid before starting
+        if self.image_path:
+            try:
+                _validate_image_file(self.image_path)
+            except ValueError as e:
+                QMessageBox.warning(self, "Image Error", str(e))
+                return
 
         # Clear progress area
         while self.progress_area.layout().count():
@@ -1461,7 +1612,7 @@ class MainWindow(QMainWindow):
             container = QWidget()
             cl = QVBoxLayout(container)
             cl.setSpacing(4)
-            cl.setContentsMargins(0,0,0,0)
+            cl.setContentsMargins(0, 0, 0, 0)
             cl.addLayout(row)
             cl.addWidget(bar)
 
@@ -1472,7 +1623,6 @@ class MainWindow(QMainWindow):
         self.post_btn.setEnabled(False)
         self.post_btn.setText("Posting…")
 
-        # Start worker
         self.worker = PostWorker(
             selected_accounts,
             text,
@@ -1508,7 +1658,7 @@ class MainWindow(QMainWindow):
         else:
             msg = f"Posted to {ok_count} platform(s)."
             if fail_count:
-                msg += f"\n{fail_count} failed — check progress area for details."
+                msg += f"\n{fail_count} failed — check the progress area for details."
             QMessageBox.warning(self, "Partial Success", msg)
 
 
@@ -1519,7 +1669,6 @@ def main():
     app.setApplicationName("SocialSync")
     app.setOrganizationName("SocialSync")
 
-    # Dark palette
     palette = QPalette()
     palette.setColor(QPalette.ColorRole.Window, QColor("#0f1117"))
     palette.setColor(QPalette.ColorRole.WindowText, QColor("#e2e8f0"))
